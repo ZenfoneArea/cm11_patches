@@ -1,0 +1,33 @@
+diff --git a/src/core/SkPaint.cpp b/src/core/SkPaint.cpp
+index 71199c7..352f405 100644
+--- a/src/core/SkPaint.cpp
++++ b/src/core/SkPaint.cpp
+@@ -137,6 +137,7 @@ start:
+ #define GEN_ID_INC_EVAL(expression)
+ #endif
+ 
++#if 0
+ extern "C" {
+     inline void memcpy_paint_opt(int* src, int* dst) {
+ #ifdef ARCH_ARM
+@@ -162,7 +163,7 @@ extern "C" {
+ #endif /* ARCH_ARM */
+     }
+ }
+-
++#endif
+ SkPaint::SkPaint() {
+     // since we may have padding, we zero everything so that our memcmp() call
+     // in operator== will work correctly.
+@@ -207,9 +208,11 @@ SkPaint::SkPaint() {
+ }
+ 
+ SkPaint::SkPaint(const SkPaint& src) {
++#if 0
+     if (sizeof(src) == SIZE_OF_PAINT)
+         memcpy_paint_opt((int*)this, (int*)&src);
+     else
++#endif
+         memcpy((int*)this, (int*)&src, sizeof(src));
+ 
+     SkSafeRef(fTypeface);

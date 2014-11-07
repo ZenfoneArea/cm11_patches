@@ -1,0 +1,17 @@
+diff --git a/config/common.mk b/config/common.mk
+index d32640c..5634ab2 100644
+--- a/config/common.mk
++++ b/config/common.mk
+@@ -217,9 +217,9 @@ PRODUCT_PACKAGES += \
+     su
+ 
+ # Terminal Emulator
+-PRODUCT_COPY_FILES +=  \
+-    vendor/cm/proprietary/Term.apk:system/app/Term.apk \
+-    vendor/cm/proprietary/lib/armeabi/libjackpal-androidterm4.so:system/lib/libjackpal-androidterm4.so
++#PRODUCT_COPY_FILES +=  \
++#    vendor/cm/proprietary/Term.apk:system/app/Term.apk \
++#    vendor/cm/proprietary/lib/armeabi/libjackpal-androidterm4.so:system/lib/libjackpal-androidterm4.so
+ 
+ PRODUCT_PROPERTY_OVERRIDES += \
+     persist.sys.root_access=1

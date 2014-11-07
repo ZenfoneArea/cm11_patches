@@ -1,0 +1,957 @@
+diff --git a/libvideoeditor/lvpp/NativeWindowRenderer.cpp b/libvideoeditor/lvpp/NativeWindowRenderer.cpp
+index 8b362ef..c36c6fd 100755
+--- a/libvideoeditor/lvpp/NativeWindowRenderer.cpp
++++ b/libvideoeditor/lvpp/NativeWindowRenderer.cpp
+@@ -317,6 +317,11 @@ NativeWindowRenderer::~NativeWindowRenderer() {
+ void NativeWindowRenderer::render(RenderInput* input) {
+     sp<GLConsumer> ST = input->mST;
+     sp<Surface> STC = input->mSTC;
++    int err;
++    err = native_window_set_buffers_transform(STC.get(), input->mTransform);
++    if (err != 0) {
++        ALOGE("native_window_set_buffers_transform failed!");
++    }
+ 
+     if (input->mIsExternalBuffer) {
+         queueExternalBuffer(STC.get(), input->mBuffer,
+@@ -396,6 +401,14 @@ void NativeWindowRenderer::queueExternalBuffer(ANativeWindow* anw,
+     MediaBuffer* buffer, int width, int height) {
+     native_window_set_buffers_geometry(anw, width, height,
+             HAL_PIXEL_FORMAT_YV12);
++
++    android_native_rect_t crop;
++    crop.left = 0;
++    crop.top = 0;
++    crop.right = width - 1;
++    crop.bottom = height - 1;
++    native_window_set_crop(anw, &crop);
++
+     native_window_set_usage(anw, GRALLOC_USAGE_SW_WRITE_OFTEN);
+ 
+     ANativeWindowBuffer* anb;
+@@ -603,6 +616,14 @@ void RenderInput::updateVideoSize(sp<MetaData> meta) {
+         mWidth = mHeight;
+         mHeight = tmp;
+     }
++
++    switch (rotationDegrees) {
++        case 0: mTransform= 0; break;
++        case 90: mTransform = HAL_TRANSFORM_ROT_90; break;
++        case 180: mTransform = HAL_TRANSFORM_ROT_180; break;
++        case 270: mTransform = HAL_TRANSFORM_ROT_270; break;
++        default: mTransform = 0; break;
++    }
+ }
+ 
+ void RenderInput::render(MediaBuffer* buffer, uint32_t videoEffect,
+diff --git a/libvideoeditor/lvpp/NativeWindowRenderer.h b/libvideoeditor/lvpp/NativeWindowRenderer.h
+index 26b4cba..79b096e 100755
+--- a/libvideoeditor/lvpp/NativeWindowRenderer.h
++++ b/libvideoeditor/lvpp/NativeWindowRenderer.h
+@@ -167,6 +167,7 @@ private:
+     sp<GLConsumer> mST;
+     sp<Surface> mSTC;
+     int mWidth, mHeight;
++    uint32_t mTransform;
+ 
+     // These are only valid during render() calls
+     uint32_t mVideoEffect;
+diff --git a/libvideoeditor/lvpp/PreviewPlayer.cpp b/libvideoeditor/lvpp/PreviewPlayer.cpp
+index 2bd9f84..945b422 100755
+--- a/libvideoeditor/lvpp/PreviewPlayer.cpp
++++ b/libvideoeditor/lvpp/PreviewPlayer.cpp
+@@ -581,6 +581,13 @@ status_t PreviewPlayer::play_l() {
+                 ALOGV("play_l: Change audio source required");
+ 
+                 if (isAudioPlayerStarted == true) {
++                     /* w/a patch to clear mPositionTimeMediaUs: sometimes it would be updated in
++                      * VideoEditorAudioPlayer::fillBuffer() too late then bring big gap between audio
++                      * and video's time stamp. It's OK for long clip transition because A/V will sync quickly.
++                      * but for short period(~0.5s) transition, all video buffers would be dropped before
++                      * sync is achieved, then transition effect couldn't be observed.
++                      */
++                    mAudioPlayer->seekTo(0LL);
+                     mAudioPlayer->pause();
+                 }
+ 
+diff --git a/libvideoeditor/vss/3gpwriter/src/M4MP4W_Writer.c b/libvideoeditor/vss/3gpwriter/src/M4MP4W_Writer.c
+index cdfc441..7faedea 100755
+--- a/libvideoeditor/vss/3gpwriter/src/M4MP4W_Writer.c
++++ b/libvideoeditor/vss/3gpwriter/src/M4MP4W_Writer.c
+@@ -4253,6 +4253,17 @@ M4OSA_ERR M4MP4W_closeWrite( M4OSA_Context context )
+                     mMp4FileDataPtr->videoTrackPtr->DSI[1]);
+                 return M4ERR_PARAMETER;
+             }
++             /* [BZ 124569]some clips may have nal length size other than 4 as usual.
++              * video encoder's output buffer always has nal length equals 4,
++              * so we uniform it to 4 bytes here, or chunk parsing will have trouble
++              * with incorrect size information.
++              */
++            if((mMp4FileDataPtr->videoTrackPtr->DSI[4] & 0x03) !=0x03) {
++                mMp4FileDataPtr->videoTrackPtr->DSI[4] |=  0x03;
++                M4OSA_TRACE2_2("modify nal length from original %#x to %#x",
++                                                        (mMp4FileDataPtr->videoTrackPtr->DSI[4] & 0x03) +1,
++                                                        mMp4FileDataPtr->videoTrackPtr->DSI[4]+1);
++            }
+             // Do not strip the DSI
+             CLEANUPonERR( M4MP4W_putBlock(mMp4FileDataPtr->videoTrackPtr->DSI,
+                 mMp4FileDataPtr->videoTrackPtr->dsiSize,
+diff --git a/libvideoeditor/vss/stagefrightshells/src/VideoEditorVideoDecoder.cpp b/libvideoeditor/vss/stagefrightshells/src/VideoEditorVideoDecoder.cpp
+index 5386cdd..93f3cf3 100755
+--- a/libvideoeditor/vss/stagefrightshells/src/VideoEditorVideoDecoder.cpp
++++ b/libvideoeditor/vss/stagefrightshells/src/VideoEditorVideoDecoder.cpp
+@@ -779,6 +779,7 @@ M4OSA_ERR queryVideoDecoderCapabilities
+     logSupportDecodersAndCapabilities(pDecoders);
+     *decoders = pDecoders;
+ cleanUp:
++    client.disconnect();
+     return err;
+ }
+ /********************
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index 5e02313..cb3a7a1 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -58,8 +58,6 @@ ifeq ($(BOARD_USES_QCOM_HARDWARE),true)
+         $(call project-path-for,qcom-media)/mm-core/inc
+ endif
+ 
+-LOCAL_MODULE:= libmediaplayerservice
+-
+ ifeq ($(TARGET_ENABLE_QC_AV_ENHANCEMENTS),true)
+     LOCAL_CFLAGS += -DENABLE_AV_ENHANCEMENTS
+     LOCAL_C_INCLUDES += $(TOP)/frameworks/av/include/media
+@@ -71,6 +69,13 @@ ifeq ($(TARGET_BOARD_PLATFORM),msm7x27a)
+     LOCAL_CFLAGS += -DUSE_SUBMIT_ONE_INPUT_BUFFER
+ endif
+ 
++# Hack to use intel AVC Encoder for camera.
++ifeq ($(TARGET_NO_METADATA_ON_AVC_ENC),true)
++    LOCAL_CFLAGS += -DNO_METADATA_ON_AVC_ENC
++endif
++
++LOCAL_MODULE:= libmediaplayerservice
++
+ include $(BUILD_SHARED_LIBRARY)
+ 
+ include $(call all-makefiles-under,$(LOCAL_PATH))
+diff --git a/media/libmediaplayerservice/StagefrightRecorder.cpp b/media/libmediaplayerservice/StagefrightRecorder.cpp
+index d3dbcbe..c1c201b 100644
+--- a/media/libmediaplayerservice/StagefrightRecorder.cpp
++++ b/media/libmediaplayerservice/StagefrightRecorder.cpp
+@@ -1303,7 +1303,13 @@ status_t StagefrightRecorder::checkVideoEncoderCapabilities(
+              mVideoEncoder == VIDEO_ENCODER_MPEG_4_SP ? MEDIA_MIMETYPE_VIDEO_MPEG4 :
+              mVideoEncoder == VIDEO_ENCODER_H264 ? MEDIA_MIMETYPE_VIDEO_AVC : ""),
+             false /* decoder */, true /* hwCodec */, &codecs);
+-    *supportsCameraSourceMetaDataMode = codecs.size() > 0;
++
++#ifdef NO_METADATA_ON_AVC_ENC
++	if(mVideoEncoder == VIDEO_ENCODER_H264)
++		*supportsCameraSourceMetaDataMode = false;
++	else
++#endif
++	*supportsCameraSourceMetaDataMode = codecs.size() > 0;
+     ALOGV("encoder %s camera source meta-data mode",
+             *supportsCameraSourceMetaDataMode ? "supports" : "DOES NOT SUPPORT");
+ 
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index 3ff1a63..e124bdb 100755
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -4006,10 +4006,11 @@ bool ACodec::LoadedState::onConfigureComponent(
+                 static_cast<NativeWindowWrapper *>(obj.get()));
+         CHECK(nativeWindow != NULL);
+         mCodec->mNativeWindow = nativeWindow->getNativeWindow();
+-
+-        native_window_set_scaling_mode(
+-                mCodec->mNativeWindow.get(),
+-                NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW);
++        if (mCodec->mNativeWindow != NULL) {
++            native_window_set_scaling_mode(
++                    mCodec->mNativeWindow.get(),
++                    NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW);
++        }
+     }
+     CHECK_EQ((status_t)OK, mCodec->initNativeWindow());
+ 
+diff --git a/media/libstagefright/Android.mk b/media/libstagefright/Android.mk
+index 5e0ed1d..c91e43a 100644
+--- a/media/libstagefright/Android.mk
++++ b/media/libstagefright/Android.mk
+@@ -79,6 +79,7 @@ LOCAL_SRC_FILES:=                         \
+         mp4/FragmentedMP4Parser.cpp       \
+         mp4/TrackFragment.cpp             \
+         APE.cpp                           \
++		ThreadedSource.cpp                \
+ 
+ LOCAL_C_INCLUDES:= \
+         $(TOP)/frameworks/av/include/media/stagefright/timedtext \
+@@ -192,6 +193,35 @@ LOCAL_SRC_FILES += \
+         chromium_http_stub.cpp
+ LOCAL_CPPFLAGS += -DCHROMIUM_AVAILABLE=1
+ 
++ifeq ($(USE_INTEL_MDP),true)
++LOCAL_C_INCLUDES += \
++        $(TARGET_OUT_HEADERS)/media_codecs
++
++LOCAL_STATIC_LIBRARIES += \
++        lib_stagefright_mdp_mp3dec \
++        libmc_mp3_dec \
++        lib_stagefright_mdp_aacdec \
++        libmc_aac_dec \
++        lib_stagefright_mdp_aacenc \
++        libmc_aac_enc \
++        lib_stagefright_mdp_amrnbdec \
++        libmc_gsmamr \
++        lib_stagefright_mdp_amrnbenc \
++        lib_stagefright_mdp_amrwbdec \
++        lib_stagefright_mdp_amrwbenc \
++        libmc_amrwb \
++        libmc_amrcommon \
++        lib_stagefright_mdp_vorbisdec \
++        libmc_vorbis_dec \
++        libmc_codec_common \
++        libmc_core \
++        lib_stagefright_mdp_wmadec \
++        libmc_wma_dec \
++
++
++LOCAL_CPPFLAGS += -DUSE_INTEL_MDP
++endif
++
+ LOCAL_SHARED_LIBRARIES += libstlport
+ include external/stlport/libstlport.mk
+ 
+diff --git a/media/libstagefright/DataSource.cpp b/media/libstagefright/DataSource.cpp
+index 14b04f9..8b6528d 100755
+--- a/media/libstagefright/DataSource.cpp
++++ b/media/libstagefright/DataSource.cpp
+@@ -307,6 +307,9 @@ sp<DataSource> DataSource::CreateFromURI(
+     }
+ 
+     if (source == NULL || source->initCheck() != OK) {
++        if (source != NULL) {
++            source.clear();
++        }
+         return NULL;
+     }
+ 
+diff --git a/media/libstagefright/MPEG4Extractor.cpp b/media/libstagefright/MPEG4Extractor.cpp
+index d1b4381..22e9d3f 100644
+--- a/media/libstagefright/MPEG4Extractor.cpp
++++ b/media/libstagefright/MPEG4Extractor.cpp
+@@ -2420,6 +2420,14 @@ status_t MPEG4Extractor::updateAudioTrackInfoFromESDS_MPEG4Audio(
+         objectType = 32 + br.getBits(6);
+     }
+ 
++#ifdef USE_INTEL_MDP
++    if ((objectType == 1) || (objectType >= 31)) {
++        ALOGD("\n >>> Found AAC mainprofile in MPEG4 Extractor... \n");
++    }
++
++    mLastTrack->meta->setInt32(kKeyAACProfile, objectType);
++#endif
++
+ #ifdef QCOM_DIRECTTRACK
+     if(objectType == 1) { //AAC Main profile
+         ALOGD("\n >>> Found AAC mainprofile in MPEG4 Extractor... \n");
+@@ -2444,11 +2452,15 @@ status_t MPEG4Extractor::updateAudioTrackInfoFromESDS_MPEG4Audio(
+         sampleRate = br.getBits(24);
+         numChannels = br.getBits(4);
+     } else {
+-        numChannels = br.getBits(4);
+-
+         if (freqIndex == 13 || freqIndex == 14) {
+             return ERROR_MALFORMED;
+         }
++        numChannels = br.getBits(4);
++        sampleRate = kSamplingRate[freqIndex];
++    }
++    if (objectType == 5 || objectType == 29) {
++        // SBR specific config per 14496-3 table 1.13
++        freqIndex = br.getBits(4);
+ 
+         sampleRate = kSamplingRate[freqIndex];
+     }
+@@ -3703,6 +3715,7 @@ status_t MPEG4Source::fragmentedRead(
+             mBuffer->set_range(0, dstOffset);
+         }
+ 
++        mBuffer->meta_data()->clear();
+         mBuffer->meta_data()->setInt64(
+                 kKeyTime, ((int64_t)cts * 1000000) / mTimescale);
+ 
+@@ -3755,7 +3768,8 @@ static bool LegacySniffMPEG4(
+         || !memcmp(header, "ftyp3ge6", 8) || !memcmp(header, "ftyp3gg6", 8)
+         || !memcmp(header, "ftypisom", 8) || !memcmp(header, "ftypM4V ", 8)
+         || !memcmp(header, "ftypM4A ", 8) || !memcmp(header, "ftypf4v ", 8)
+-        || !memcmp(header, "ftypkddi", 8) || !memcmp(header, "ftypM4VP", 8)) {
++        || !memcmp(header, "ftypkddi", 8) || !memcmp(header, "ftypM4VP", 8)
++        || !memcmp(header, "ftypqt  ", 8)) {
+         *mimeType = MEDIA_MIMETYPE_CONTAINER_MPEG4;
+         *confidence = 0.4;
+ 
+diff --git a/media/libstagefright/MPEG4Writer.cpp b/media/libstagefright/MPEG4Writer.cpp
+index 1546a7e..3e8021d 100644
+--- a/media/libstagefright/MPEG4Writer.cpp
++++ b/media/libstagefright/MPEG4Writer.cpp
+@@ -1108,6 +1108,9 @@ static void StripStartcode(MediaBuffer *buffer) {
+     if (!memcmp(ptr, "\x00\x00\x00\x01", 4)) {
+         buffer->set_range(
+                 buffer->range_offset() + 4, buffer->range_length() - 4);
++    } else {
++        //nal length prefixed
++        return;
+     }
+ #endif
+ }
+diff --git a/media/libstagefright/NuCachedSource2.cpp b/media/libstagefright/NuCachedSource2.cpp
+index 569e8a7..50ed117 100644
+--- a/media/libstagefright/NuCachedSource2.cpp
++++ b/media/libstagefright/NuCachedSource2.cpp
+@@ -500,6 +500,10 @@ ssize_t NuCachedSource2::readAtInternal(off64_t offset, void *data, size_t size,
+ 
+     Mutex::Autolock autoLock(mLock);
+ 
++    if (offset < 0) {
++        return ERROR_OUT_OF_RANGE;
++    }
++
+     // If the request can be completely satisfied from the cache, do so.
+ 
+     if (offset >= mCacheOffset
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index 269028a..c04f6e7 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -59,6 +59,11 @@
+ 
+ #include "include/avc_utils.h"
+ 
++#ifdef USE_INTEL_MDP
++#include "UMCMacro.h"
++#include "include/ThreadedSource.h"
++#endif
++
+ #ifdef ENABLE_AV_ENHANCEMENTS
+ #include <QCMediaDefs.h>
+ #include <QCMetaData.h>
+@@ -122,6 +127,17 @@ static sp<MediaSource> Make##name(const sp<MediaSource> &source, const sp<MetaDa
+     return new name(source, meta); \
+ }
+ 
++#ifdef USE_INTEL_MDP
++FACTORY_CREATE_DECL(CIPMP3Decoder)
++FACTORY_CREATE_DECL(CIPAACDecoder)
++FACTORY_CREATE_ENCODER_DECL(CIPAACEncoder)
++FACTORY_CREATE_DECL(CIPAMRNBDecoder)
++FACTORY_CREATE_DECL(CIPAMRWBDecoder)
++FACTORY_CREATE_ENCODER_DECL(CIPAMRWBEncoder)
++FACTORY_CREATE_DECL(CIPVorbisDecoder)
++FACTORY_CREATE_DECL(CIPWMADecoder)
++#endif
++
+ #define FACTORY_REF(name) { #name, Make##name },
+ 
+ #ifdef QTI_FLAC_DECODER
+@@ -141,8 +157,19 @@ static sp<MediaSource> InstantiateSoftwareEncoder(
+         const char *name;
+         sp<MediaSource> (*CreateFunc)(const sp<MediaSource> &, const sp<MetaData> &);
+     };
++    if (!strncmp(name, "CIPAACEncoder", 13)) {
++        int32_t aacProfile;
++        meta->findInt32(kKeyAACProfile, &aacProfile);
++        if(aacProfile != OMX_AUDIO_AACObjectLC) {
++           return NULL; //Use Google AAC encoder for all AAC profiles except AAC_LC.
++        }
++    }
+ 
+     static const FactoryInfo kFactoryInfo[] = {
++#ifdef USE_INTEL_MDP
++        FACTORY_REF(CIPAMRWBEncoder)
++        FACTORY_REF(CIPAACEncoder)
++#endif // #ifdef USE_INTEL_MDP
+         FACTORY_REF(AACEncoder)
+     };
+     for (size_t i = 0;
+@@ -155,6 +182,35 @@ static sp<MediaSource> InstantiateSoftwareEncoder(
+     return NULL;
+ }
+ 
++#ifdef USE_INTEL_MDP
++/* for SF decoders plug-ins */
++static sp<MediaSource> InstantiateSoftwareCodec(
++        const char *name, const sp<MediaSource> &source) {
++    struct FactoryInfo {
++        const char *name;
++        sp<MediaSource> (*CreateFunc)(const sp<MediaSource> &);
++    };
++
++    static const FactoryInfo kFactoryInfo[] = {
++
++        FACTORY_REF(CIPMP3Decoder)
++        FACTORY_REF(CIPAACDecoder)
++        FACTORY_REF(CIPAMRNBDecoder)
++        FACTORY_REF(CIPAMRWBDecoder)
++        FACTORY_REF(CIPVorbisDecoder)
++        FACTORY_REF(CIPWMADecoder)
++    };
++    for (size_t i = 0;
++         i < sizeof(kFactoryInfo) / sizeof(kFactoryInfo[0]); ++i) {
++        if (!strcmp(name, kFactoryInfo[i].name)) {
++           return (*kFactoryInfo[i].CreateFunc)(source);
++        }
++    }
++
++    return NULL;
++}
++#endif // #ifdef USE_INTEL_MDP
++
+ #if defined(QCOM_DIRECTTRACK) || defined (QTI_FLAC_DECODER)
+ static sp<MediaSource> InstantiateSoftwareDecoder(
+         const char *name, const sp<MediaSource> &source) {
+@@ -391,7 +447,7 @@ uint32_t OMXCodec::getComponentQuirks(
+         quirks |= kOutputBuffersAreUnreadable;
+     }
+     if (list->codecHasQuirk(
+-                index, "requies-loaded-to-idle-after-allocation")) {
++                index, "requires-loaded-to-idle-after-allocation")) {
+         quirks |= kRequiresLoadedToIdleAfterAllocation;
+     }
+     if (list->codecHasQuirk(
+@@ -524,7 +580,7 @@ sp<MediaSource> OMXCodec::Create(
+             componentName = tmp.c_str();
+         }
+ 
+-        sp<MediaSource> softwareCodec;
++#ifndef USE_INTEL_MDP
+         if (createEncoder) {
+             softwareCodec = InstantiateSoftwareEncoder(componentName, source, meta);
+         }
+@@ -539,6 +595,17 @@ sp<MediaSource> OMXCodec::Create(
+ 
+             return softwareCodec;
+         }
++#else
++        sp<MediaSource> softwareCodec = (createEncoder)?
++            InstantiateSoftwareEncoder(componentName, source, meta):
++            InstantiateSoftwareCodec(componentName, source);
++
++            if (softwareCodec != NULL) {
++                ALOGV("Successfully allocated software codec '%s'", componentName);
++
++                return softwareCodec;
++            }
++#endif
+ 
+ #ifdef QCOM_HARDWARE
+         const char* ext_componentName = ExtendedCodec::overrideComponentName(quirks, meta);
+@@ -577,6 +644,9 @@ sp<MediaSource> OMXCodec::Create(
+ 
+             err = codec->configureCodec(meta);
+             if (err == OK) {
++                if (!strncmp("OMX.Intel.VideoEncoder", componentName, 22)) {
++                    codec->mFlags &= ~kOnlySubmitOneInputBufferAtOneTime;
++                }
+                 return codec;
+             }
+ 
+@@ -1205,7 +1275,7 @@ status_t OMXCodec::isColorFormatSupported(
+         // the incremented index (bug 2897413).
+         CHECK_EQ(index, portFormat.nIndex);
+         if (portFormat.eColorFormat == colorFormat) {
+-            CODEC_LOGE("Found supported color format: %d", portFormat.eColorFormat);
++            CODEC_LOGV("Found supported color format: %d", portFormat.eColorFormat);
+             return OK;  // colorFormat is supported!
+         }
+         ++index;
+@@ -1474,7 +1544,7 @@ status_t OMXCodec::getVideoProfileLevel(
+ 
+     CODEC_LOGE("Target profile (%d) and level (%d) is not supported",
+             profile, level);
+-    return BAD_VALUE;
++    return OK;
+ }
+ 
+ status_t OMXCodec::setupH263EncoderParameters(const sp<MetaData>& meta) {
+@@ -2508,15 +2578,9 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
+         cancelEnd = def.nBufferCountActual;
+     }
+ 
+-
+-    if (err != 0 &&
+-        ((mState == LOADED) || (mState == LOADED_TO_IDLE))) {
+-        freeBuffersOnPort(kPortIndexOutput);
+-    } else {
+-        for (OMX_U32 i = cancelStart; i < cancelEnd; i++) {
+-            BufferInfo *info = &mPortBuffers[kPortIndexOutput].editItemAt(i);
+-            cancelBufferToNativeWindow(info);
+-        }
++    for (OMX_U32 i = cancelStart; i < cancelEnd; i++) {
++        BufferInfo *info = &mPortBuffers[kPortIndexOutput].editItemAt(i);
++        cancelBufferToNativeWindow(info);
+     }
+ 
+     return err;
+@@ -3069,6 +3133,16 @@ void OMXCodec::onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2) {
+         {
+             CODEC_LOGE("ERROR(0x%08lx, %ld)", data1, data2);
+ 
++            // we should hanlde error occur in initialization that calling MediaSource::stop()
++            // when mState equals to LOADED_TO_IDLE, it means OMXComponet is initializing
++            // only in initialization stage.
++            if(mState == LOADED_TO_IDLE)
++            {
++               freeBuffersOnPort(kPortIndexInput);
++               freeBuffersOnPort(kPortIndexOutput);
++               mSource->stop();
++            }
++
+             setState(ERROR);
+             break;
+         }
+@@ -3083,6 +3157,7 @@ void OMXCodec::onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2) {
+                 // when the OMX_EventPortSettingsChanged is not meant for reallocating
+                 // the output buffers.
+                 if (data1 == kPortIndexOutput) {
++                    mFilledBuffers.clear();
+                     CHECK(mFilledBuffers.empty());
+                 }
+                 onPortSettingsChanged(data1);
+@@ -3442,7 +3517,7 @@ status_t OMXCodec::freeBuffersOnPort(
+     for (size_t i = buffers->size(); i-- > 0;) {
+         BufferInfo *info = &buffers->editItemAt(i);
+ 
+-        if (onlyThoseWeOwn && info->mStatus == OWNED_BY_COMPONENT) {
++        if (onlyThoseWeOwn && (info->mStatus == OWNED_BY_COMPONENT || info->mStatus==OWNED_BY_CLIENT)) {
+             continue;
+         }
+ 
+@@ -3693,7 +3768,8 @@ bool OMXCodec::drainInputBuffer(BufferInfo *info) {
+ 
+         size_t size = specific->mSize;
+ 
+-        if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mMIME)
++        if ((!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mMIME) ||
++             !strcasecmp(MEDIA_MIMETYPE_VIDEO_HEVC, mMIME))
+                 && !(mQuirks & kWantsNALFragments)) {
+             static const uint8_t kNALStartCode[4] =
+                     { 0x00, 0x00, 0x00, 0x01 };
+@@ -5363,6 +5439,12 @@ void OMXCodec::signalBufferReturned(MediaBuffer *buffer) {
+         BufferInfo *info = &buffers->editItemAt(i);
+ 
+         if (info->mMediaBuffer == buffer) {
++            if (mPortStatus[kPortIndexOutput] == DISABLING) {
++                CODEC_LOGV("Port is disabled, freeing buffer %p", buffer);
++                status_t err = freeBuffer(kPortIndexOutput, i);
++                CHECK_EQ(err, (status_t)OK);
++                return;
++            }
+             CHECK_EQ((int)mPortStatus[kPortIndexOutput], (int)ENABLED);
+             CHECK_EQ((int)info->mStatus, (int)OWNED_BY_CLIENT);
+ 
+diff --git a/media/libstagefright/ThreadedSource.cpp b/media/libstagefright/ThreadedSource.cpp
+index e69de29..c3f3ea0 100644
+--- a/media/libstagefright/ThreadedSource.cpp
++++ b/media/libstagefright/ThreadedSource.cpp
+@@ -0,0 +1,218 @@
++/*
++ * Copyright (C) 2010 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "ThreadedSource"
++//#define LOG_NDEBUG 0
++#include <utils/Log.h>
++
++#include "include/ThreadedSource.h"
++
++#include <media/stagefright/foundation/ADebug.h>
++#include <media/stagefright/foundation/AMessage.h>
++#include <media/stagefright/MediaBuffer.h>
++#include <media/stagefright/MetaData.h>
++
++namespace android {
++
++ThreadedSource::ThreadedSource(const sp<MediaSource> &source, int size)
++    : mSource(source),
++      mReflector(new AHandlerReflector<ThreadedSource>(this)),
++      mLooper(new ALooper),
++      mStarted(false),
++      mMaxQueueSize(size) {
++    mLooper->registerHandler(mReflector);
++}
++
++ThreadedSource::~ThreadedSource() {
++    if (mStarted) {
++        stop();
++    }
++}
++
++status_t ThreadedSource::start(MetaData *params) {
++    CHECK(!mStarted);
++
++    status_t err = mSource->start(params);
++
++    if (err != OK) {
++        return err;
++    }
++
++    mFinalResult = OK;
++    mSeekTimeUs = -1;
++    mReadPending = false;
++
++    Mutex::Autolock autoLock(mLock);
++    postReadMore_l();
++
++    CHECK_EQ(mLooper->start(), (status_t)OK);
++
++    mStarted = true;
++
++    return OK;
++}
++
++status_t ThreadedSource::stop() {
++    CHECK(mStarted);
++
++    CHECK_EQ(mLooper->stop(), (status_t)OK);
++
++    Mutex::Autolock autoLock(mLock);
++    clearQueue_l();
++
++    status_t err = mSource->stop();
++
++    mStarted = false;
++
++    return err;
++}
++
++sp<MetaData> ThreadedSource::getFormat() {
++    return mSource->getFormat();
++}
++
++status_t ThreadedSource::read(
++        MediaBuffer **buffer, const ReadOptions *options) {
++    *buffer = NULL;
++
++    Mutex::Autolock autoLock(mLock);
++
++    int64_t seekTimeUs;
++    ReadOptions::SeekMode seekMode;
++    if (options && options->getSeekTo(&seekTimeUs, &seekMode)) {
++        int32_t seekComplete = 0;
++
++        sp<AMessage> msg = new AMessage(kWhatSeek, mReflector->id());
++        msg->setInt64("timeUs", seekTimeUs);
++        msg->setInt32("mode", seekMode);
++        msg->setPointer("complete", &seekComplete);
++        msg->post();
++
++        while (!seekComplete) {
++            status_t err = mCondition.wait(mLock);
++            if (err != OK) {
++                return err;
++            }
++        }
++    }
++
++    while (mQueue.empty() && mFinalResult == OK) {
++        status_t err = mCondition.wait(mLock);
++        if (err != OK) {
++            return err;
++        }
++    }
++
++    if (!mQueue.empty()) {
++        *buffer = *mQueue.begin();
++        mQueue.erase(mQueue.begin());
++
++        if (mFinalResult == OK) {
++            postReadMore_l();
++        }
++
++        return OK;
++    }
++
++    return mFinalResult;
++}
++
++void ThreadedSource::onMessageReceived(const sp<AMessage> &msg) {
++    switch (msg->what()) {
++        case kWhatSeek:
++        {
++            CHECK(msg->findInt64("timeUs", &mSeekTimeUs));
++            CHECK_GE(mSeekTimeUs, 0ll);
++
++            int32_t x;
++            CHECK(msg->findInt32("mode", &x));
++            mSeekMode = (ReadOptions::SeekMode)x;
++
++            int32_t *seekComplete;
++            CHECK(msg->findPointer("complete", (void **)&seekComplete));
++
++            Mutex::Autolock autoLock(mLock);
++            clearQueue_l();
++            mFinalResult = OK;
++
++            *seekComplete = 1;
++            mCondition.signal();
++
++            postReadMore_l();
++            break;
++        }
++
++        case kWhatReadMore:
++        {
++            {
++                Mutex::Autolock autoLock(mLock);
++                mReadPending = false;
++
++                if (mQueue.size() == mMaxQueueSize) {
++                    break;
++                }
++            }
++
++            MediaBuffer *buffer;
++            ReadOptions options;
++            if (mSeekTimeUs >= 0) {
++                options.setSeekTo(mSeekTimeUs, mSeekMode);
++                mSeekTimeUs = -1ll;
++            }
++            status_t err = mSource->read(&buffer, &options);
++
++            Mutex::Autolock autoLock(mLock);
++
++            if (err != OK) {
++                mFinalResult = err;
++            } else {
++                mQueue.push_back(buffer);
++
++                if (mQueue.size() < mMaxQueueSize) {
++                    postReadMore_l();
++                }
++            }
++
++            mCondition.signal();
++            break;
++        }
++
++        default:
++            TRESPASS();
++            break;
++    }
++}
++
++void ThreadedSource::postReadMore_l() {
++    if (mReadPending) {
++        return;
++    }
++
++    mReadPending = true;
++    (new AMessage(kWhatReadMore, mReflector->id()))->post();
++}
++
++void ThreadedSource::clearQueue_l() {
++    while (!mQueue.empty()) {
++        MediaBuffer *buffer = *mQueue.begin();
++        mQueue.erase(mQueue.begin());
++
++        buffer->release();
++        buffer = NULL;
++    }
++}
++
++}  // namespace android
+diff --git a/media/libstagefright/include/ThreadedSource.h b/media/libstagefright/include/ThreadedSource.h
+index e69de29..42d0d96 100644
+--- a/media/libstagefright/include/ThreadedSource.h
++++ b/media/libstagefright/include/ThreadedSource.h
+@@ -0,0 +1,79 @@
++/*
++ * Copyright (C) 2010 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef THREADED_SOURCE_H_
++
++#define THREADED_SOURCE_H_
++
++#include <media/stagefright/foundation/ABase.h>
++#include <media/stagefright/foundation/AHandlerReflector.h>
++#include <media/stagefright/foundation/ALooper.h>
++#include <media/stagefright/MediaSource.h>
++#include <utils/threads.h>
++
++namespace android {
++
++struct ThreadedSource : public MediaSource {
++    ThreadedSource(const sp<MediaSource> &source, int size = kMaxQueueSize);
++
++    virtual status_t start(MetaData *params);
++    virtual status_t stop();
++
++    virtual sp<MetaData> getFormat();
++
++    virtual status_t read(
++            MediaBuffer **buffer, const ReadOptions *options);
++
++    virtual void onMessageReceived(const sp<AMessage> &msg);
++
++protected:
++    virtual ~ThreadedSource();
++
++private:
++    enum {
++        kWhatReadMore = 'read',
++        kWhatSeek       = 'seek',
++    };
++
++    sp<MediaSource> mSource;
++    sp<AHandlerReflector<ThreadedSource> > mReflector;
++    sp<ALooper> mLooper;
++
++    Mutex mLock;
++    Condition mCondition;
++    List<MediaBuffer *> mQueue;
++    status_t mFinalResult;
++    bool mReadPending;
++    bool mStarted;
++
++    int mMaxQueueSize;
++
++    int64_t mSeekTimeUs;
++    ReadOptions::SeekMode mSeekMode;
++
++    enum {
++        kMaxQueueSize = 10,
++    };
++
++    void postReadMore_l();
++    void clearQueue_l();
++
++    DISALLOW_EVIL_CONSTRUCTORS(ThreadedSource);
++};
++
++}  // namespace android
++
++#endif  // THREADED_SOURCE_H_
+diff --git a/services/camera/libcameraservice/CameraService.cpp b/services/camera/libcameraservice/CameraService.cpp
+index eab3c2a..cc013a0 100644
+--- a/services/camera/libcameraservice/CameraService.cpp
++++ b/services/camera/libcameraservice/CameraService.cpp
+@@ -882,6 +882,7 @@ MediaPlayer* CameraService::newMediaPlayer(const char *file) {
+         mp->prepare();
+     } else {
+         ALOGE("Failed to load CameraService sounds: %s", file);
++        delete mp;
+         return NULL;
+     }
+     return mp;
+@@ -1184,6 +1185,7 @@ status_t CameraService::dump(int fd, const Vector<String16>& args) {
+         if (!mModule) {
+             result = String8::format("No camera module available!\n");
+             write(fd, result.string(), result.size());
++            if (locked) mServiceLock.unlock();
+             return NO_ERROR;
+         }
+ 
+diff --git a/services/camera/libcameraservice/api1/Camera2Client.cpp b/services/camera/libcameraservice/api1/Camera2Client.cpp
+index b093946..9d95eb4 100644
+--- a/services/camera/libcameraservice/api1/Camera2Client.cpp
++++ b/services/camera/libcameraservice/api1/Camera2Client.cpp
+@@ -406,6 +406,12 @@ void Camera2Client::disconnect() {
+         l.mParameters.state = Parameters::DISCONNECTED;
+     }
+ 
++    mStreamingProcessor->deletePreviewStream();
++    mStreamingProcessor->deleteRecordingStream();
++    mJpegProcessor->deleteStream();
++    mCallbackProcessor->deleteStream();
++    mZslProcessor->deleteStream();
++
+     mStreamingProcessor->requestExit();
+     mFrameProcessor->requestExit();
+     mCaptureSequencer->requestExit();
+@@ -832,6 +838,18 @@ status_t Camera2Client::startPreviewL(Parameters &params, bool restart) {
+         res = mStreamingProcessor->startStream(StreamingProcessor::PREVIEW,
+                 outputStreams);
+     } else {
++        // With recording hint set, we're going to be operating under the
++        // assumption that the user will record video. To optimize recording
++        // startup time, create the necessary output streams for recording and
++        // video snapshot now if they don't already exist.
++        res = mJpegProcessor->updateStream(params);
++        if (res != OK) {
++            ALOGE("%s: Camera %d: Can't pre-configure still image "
++                    "stream: %s (%d)",
++                    __FUNCTION__, mCameraId, strerror(-res), res);
++            return res;
++        }
++
+         if (!restart) {
+             res = mStreamingProcessor->updateRecordingRequest(params);
+             if (res != OK) {
+diff --git a/services/camera/libcameraservice/api1/CameraClient.cpp b/services/camera/libcameraservice/api1/CameraClient.cpp
+index 1629e05..0204fbd 100644
+--- a/services/camera/libcameraservice/api1/CameraClient.cpp
++++ b/services/camera/libcameraservice/api1/CameraClient.cpp
+@@ -368,6 +368,7 @@ status_t CameraClient::startPreview() {
+ status_t CameraClient::startRecording() {
+     Mutex::Autolock lock(mLock);
+     LOG1("startRecording (pid %d)", getCallingPid());
++    disableMsgType(CAMERA_MSG_SHUTTER);
+     return startCameraMode(CAMERA_RECORDING_MODE);
+ }
+ 
+diff --git a/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp b/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp
+index 6076dae..8f20bfe 100644
+--- a/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp
++++ b/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp
+@@ -733,6 +733,9 @@ void StreamingProcessor::releaseRecordingFrame(const sp<IMemory>& mem) {
+     ATRACE_CALL();
+     status_t res;
+ 
++    sp<Camera2Client> client = mClient.promote();
++    if (client == 0) return;
++
+     Mutex::Autolock m(mMutex);
+     // Make sure this is for the current heap
+     ssize_t offset;
+diff --git a/services/camera/libcameraservice/device1/CameraHardwareInterface.h b/services/camera/libcameraservice/device1/CameraHardwareInterface.h
+index 7e71c87..ac80c23 100644
+--- a/services/camera/libcameraservice/device1/CameraHardwareInterface.h
++++ b/services/camera/libcameraservice/device1/CameraHardwareInterface.h
+@@ -111,6 +111,11 @@ public:
+         ALOGV("%s(%s) buf %p", __FUNCTION__, mName.string(), buf.get());
+ 
+         if (mDevice->ops->set_preview_window) {
++            if (buf.get() == NULL) {
++                int ret = mDevice->ops->set_preview_window(mDevice, 0);
++                mPreviewWindow = buf;
++                return ret;
++            }
+             mPreviewWindow = buf;
+             mHalPreviewWindow.user = this;
+             ALOGV("%s &mHalPreviewWindow %p mHalPreviewWindow.user %p", __FUNCTION__,
